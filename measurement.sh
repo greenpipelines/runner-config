@@ -7,7 +7,7 @@ OUTPUT_DIR="/tmp/wattsci"
 BASELINE_DIR="$OUTPUT_DIR/baseline"
 
 VARS_SCRIPT="$SCRIPT_DIR/vars.sh"
-VARS_FILE="$OUTPUT_DIR/vars.sh"
+CI_VARS_SCRIPT="$SCRIPT_DIR/ci_vars.sh"
 
 PID_FILE="$OUTPUT_DIR/measurement.pid"
 BASELINE_PID_FILE="$BASELINE_DIR/measurement.pid"
@@ -22,7 +22,7 @@ PERF_BASELINE_FILE="$BASELINE_DIR/data.txt"
 TOOL_LOG_FILE="$OUTPUT_DIR/perf.log"
 
 # --------------------------------------------------
-# Logging
+# Helpers
 # --------------------------------------------------
 
 log() {
@@ -76,76 +76,25 @@ CONFIG_FILENAME="$(basename -- "$CONFIG_FILE")"
 cp -- "$CONFIG_FILE" "$OUTPUT_DIR/$CONFIG_FILENAME"
 
 # --------------------------------------------------
-# CI variables
-# vars.sh defines add_var and initialize_vars.
-# The variable values are written to /tmp/wattsci/vars.sh.
+# CI variables: reuse existing scripts
 # --------------------------------------------------
 
-if [[ -f "$VARS_SCRIPT" ]]; then
-    source "$VARS_SCRIPT"
+if [[ -f "$CI_VARS_SCRIPT" ]]; then
+    # ci_vars.sh sources vars.sh and defines load_ci_vars.
+    source "$CI_VARS_SCRIPT"
 
     if declare -F initialize_vars >/dev/null &&
-       declare -F add_var >/dev/null; then
-
+       declare -F load_ci_vars >/dev/null; then
         initialize_vars
-
-        if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
-            add_var CI "GitHub"
-            add_var RUN_ID "${GITHUB_RUN_ID}"
-            add_var REF_NAME "${GITHUB_REF_NAME:-unknown}"
-            add_var REPOSITORY "${GITHUB_REPOSITORY:-unknown}"
-            add_var WORKFLOW_ID "${GITHUB_WORKFLOW:-unknown}"
-            add_var WORKFLOW_NAME "${GITHUB_WORKFLOW:-unknown}"
-            add_var COMMIT_HASH "${GITHUB_SHA:-unknown}"
-
-        elif [[ -n "${CI_PIPELINE_ID:-}" ]]; then
-            add_var CI "GitLab"
-            add_var RUN_ID "${CI_PIPELINE_ID}"
-            add_var REF_NAME "${CI_COMMIT_REF_NAME:-unknown}"
-            add_var REPOSITORY "${CI_PROJECT_PATH:-unknown}"
-            add_var WORKFLOW_ID "${CI_JOB_ID:-unknown}"
-            add_var WORKFLOW_NAME "${CI_JOB_NAME:-unknown}"
-            add_var COMMIT_HASH "${CI_COMMIT_SHA:-unknown}"
-
-        elif [[ -n "${BITBUCKET_BUILD_NUMBER:-}" ]]; then
-            add_var CI "Bitbucket"
-            add_var RUN_ID "${BITBUCKET_BUILD_NUMBER}"
-            add_var REF_NAME "${BITBUCKET_BRANCH:-unknown}"
-            add_var REPOSITORY "${BITBUCKET_REPO_SLUG:-unknown}"
-            add_var WORKFLOW_ID "${BITBUCKET_BUILD_NUMBER}"
-            add_var WORKFLOW_NAME "${BITBUCKET_BUILD_NUMBER}"
-            add_var COMMIT_HASH "${BITBUCKET_COMMIT:-unknown}"
-
-        elif [[ -n "${BUILD_NUMBER:-}" ]]; then
-            add_var CI "Bamboo"
-            add_var RUN_ID "${BUILD_NUMBER}"
-            add_var REF_NAME "${BRANCH_NAME:-unknown}"
-            add_var REPOSITORY "${BUILD_REPOSITORY_NAME:-unknown}"
-            add_var WORKFLOW_ID "${BUILD_NUMBER}"
-            add_var WORKFLOW_NAME "${BUILD_NAME:-$BUILD_NUMBER}"
-            add_var COMMIT_HASH "${BUILD_VCS_NUMBER:-unknown}"
-
-        elif [[ -n "${CIRCLE_WORKFLOW_ID:-}" ]]; then
-            add_var CI "CircleCI"
-            add_var RUN_ID "${CIRCLE_WORKFLOW_ID}"
-            add_var REF_NAME "${CIRCLE_BRANCH:-unknown}"
-            add_var REPOSITORY "${CIRCLE_PROJECT_REPONAME:-unknown}"
-            add_var WORKFLOW_ID "${CIRCLE_WORKFLOW_ID}"
-            add_var WORKFLOW_NAME "${CIRCLE_WORKFLOW_ID}"
-            add_var COMMIT_HASH "${CIRCLE_SHA1:-unknown}"
-
-        elif [[ -n "${BUILD_BUILDID:-}" ]]; then
-            add_var CI "AzureDevOps"
-            add_var RUN_ID "${BUILD_BUILDID}"
-            add_var REF_NAME "${BUILD_SOURCEBRANCHNAME:-unknown}"
-            add_var REPOSITORY "${BUILD_REPOSITORY_URI:-unknown}"
-            add_var WORKFLOW_ID "${BUILD_BUILDID}"
-            add_var WORKFLOW_NAME "${BUILD_DEFINITIONNAME:-$BUILD_BUILDID}"
-            add_var COMMIT_HASH "${BUILD_SOURCEVERSION:-unknown}"
-        fi
-
-        log "CI variables saved using vars.sh"
+        load_ci_vars
+        log "CI variables saved to /tmp/wattsci/vars.sh"
+    else
+        die "ci_vars.sh must define initialize_vars and load_ci_vars"
     fi
+elif [[ -f "$VARS_SCRIPT" ]]; then
+    log "WARNING: ci_vars.sh not found; skipping CI variable collection"
+else
+    log "WARNING: vars.sh and ci_vars.sh not found; skipping CI variables"
 fi
 
 # --------------------------------------------------
@@ -163,9 +112,7 @@ read_config_value() {
             return s
         }
 
-        /^[[:space:]]*[;#]/ {
-            next
-        }
+        /^[[:space:]]*[;#]/ { next }
 
         /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
             current_section = $0
@@ -176,19 +123,13 @@ read_config_value() {
         }
 
         {
-            if (current_section != wanted_section) {
-                next
-            }
+            if (current_section != wanted_section) next
 
             pos = index($0, "=")
-            if (!pos) {
-                next
-            }
+            if (!pos) next
 
             current_key = trim(substr($0, 1, pos - 1))
-            if (current_key != wanted_key) {
-                next
-            }
+            if (current_key != wanted_key) next
 
             value = trim(substr($0, pos + 1))
 
@@ -203,7 +144,7 @@ read_config_value() {
 }
 
 # --------------------------------------------------
-# Read configuration
+# Configuration
 # --------------------------------------------------
 
 TOOL_NAME="$(read_config_value "tool" "name")"
@@ -219,12 +160,10 @@ TOOL_SCRIPT="$SCRIPT_DIR/${TOOL_NAME}.sh"
 [[ -f "$TOOL_SCRIPT" ]] || die "Tool script not found: $TOOL_SCRIPT"
 
 log "Tool: $TOOL_NAME"
-log "Sampling interval: $SAMPLING_INTERVAL"
-log "Events: $EVENTS"
 log "Baseline enabled: ${HAS_BASELINE:-false}"
 
 # --------------------------------------------------
-# Process helpers
+# Process management
 # --------------------------------------------------
 
 is_running() {
@@ -232,10 +171,9 @@ is_running() {
     local pid
 
     [[ -f "$pid_file" ]] || return 1
-
     pid="$(<"$pid_file")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
 
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     kill -0 "$pid" 2>/dev/null
 }
 
@@ -272,7 +210,6 @@ start_process() {
     log "Output: $output_file"
 }
 
-# Stop directly with SIGTERM, then wait up to 5 seconds.
 stop_process() {
     local pid_file="$1"
     local timer_end="$2"
@@ -287,14 +224,13 @@ stop_process() {
     pid="$(<"$pid_file")"
 
     if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
-        rm -f -- "$pid_file"
         die "Invalid PID in $pid_file"
     fi
 
     if ! kill -0 "$pid" 2>/dev/null; then
         rm -f -- "$pid_file"
-        log "Process $pid is no longer running"
         date +%s > "$timer_end"
+        log "Process $pid is no longer running"
         return 0
     fi
 
@@ -308,18 +244,16 @@ stop_process() {
 
     if kill -0 "$pid" 2>/dev/null; then
         log "ERROR: PID $pid is still running after SIGTERM"
-        log "Keeping PID file for later inspection"
         return 1
     fi
 
     rm -f -- "$pid_file"
     date +%s > "$timer_end"
-
     log "Process $pid stopped"
 }
 
 # --------------------------------------------------
-# Baseline
+# Measurement actions
 # --------------------------------------------------
 
 baseline_has_data() {
@@ -349,26 +283,26 @@ start_normal_measurement() {
 }
 
 run_baseline_automatically() {
-    log "Baseline file is empty; running baseline for 10 seconds."
+    log "Running baseline for 10 seconds"
 
     start_baseline
     sleep 10
     stop_baseline
 
     if is_running "$BASELINE_PID_FILE"; then
-        die "Baseline process is still running; normal measurement will not start."
+        die "Baseline is still running; normal measurement will not start"
     fi
 
     if ! baseline_has_data; then
-        die "Baseline produced no data. Inspect $TOOL_LOG_FILE"
+        die "Baseline produced no data. Check $TOOL_LOG_FILE"
     fi
 
-    log "Baseline completed; starting normal measurement."
+    log "Baseline completed; starting normal measurement"
     start_normal_measurement
 }
 
 # --------------------------------------------------
-# Actions
+# Dispatch
 # --------------------------------------------------
 
 case "$ACTION" in
