@@ -91,6 +91,11 @@ echo "Configuration copied to: $CONFIG_OUTPUT_FILE"
 
 # ============================================================
 # Read INI configuration
+# Supports quoted and unquoted values.
+# Examples:
+#   name = "perf"          -> perf
+#   sampling_interval = 20 -> 20
+#   baseline = true        -> true
 # ============================================================
 
 read_config_value() {
@@ -108,8 +113,8 @@ read_config_value() {
         current_section == section {
             line = $0
 
-            # Ignore full-line comments
-            if (line ~ /^[[:space:]]*[#;]/) {
+            if (line ~ /^[[:space:]]*$/ ||
+                line ~ /^[[:space:]]*[#;]/) {
                 next
             }
 
@@ -123,6 +128,17 @@ read_config_value() {
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
 
                 if (k == key) {
+                    # Remove quotes only if they surround the whole value.
+                    if (length(v) >= 2) {
+                        first = substr(v, 1, 1)
+                        last = substr(v, length(v), 1)
+
+                        if ((first == "\"" && last == "\"") ||
+                            (first == "\047" && last == "\047")) {
+                            v = substr(v, 2, length(v) - 2)
+                        }
+                    }
+
                     print v
                     exit
                 }
@@ -140,6 +156,8 @@ if [[ -z "$TOOL_NAME" ]]; then
     exit 1
 fi
 
+echo "Selected tool: $TOOL_NAME"
+
 # ============================================================
 # Tool-specific configuration
 # ============================================================
@@ -149,7 +167,7 @@ TOOL_LOG_FILE=""
 
 case "$TOOL_NAME" in
     perf)
-        # Output files for perf are declared only for this tool.
+        # Define perf output files only when perf is selected.
         PERF_OUTPUT_FILE="$OUTPUT_DIR/data.txt"
         PERF_BASELINE_FILE="$OUTPUT_DIR/baseline/data.txt"
 
@@ -244,7 +262,6 @@ stop_measurement() {
     fi
 
     if kill -0 "$pid" 2>/dev/null; then
-        # Send SIGINT so perf can finish and write its results.
         kill -INT "$pid" 2>/dev/null || true
 
         for _ in {1..15}; do
