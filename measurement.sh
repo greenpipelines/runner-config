@@ -6,9 +6,15 @@ set -euo pipefail
 # General paths
 # ============================================================
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 OUTPUT_DIR="/tmp/wattsci"
 
+# Main measurement PID
 PID_FILE="$OUTPUT_DIR/measurement.pid"
+
+# Baseline measurement PID
+BASELINE_PID_FILE="$OUTPUT_DIR/baseline/measurement.pid"
 
 # Main measurement timers
 TIMER_FILE_START="$OUTPUT_DIR/timer_start.txt"
@@ -18,9 +24,17 @@ TIMER_FILE_END="$OUTPUT_DIR/timer_end.txt"
 TIMER_FILE_BASELINE_START="$OUTPUT_DIR/baseline/start.txt"
 TIMER_FILE_BASELINE_END="$OUTPUT_DIR/baseline/end.txt"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
 mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/baseline"
+
+# ============================================================
+# CI variables
+# ============================================================
+
+VARS_FILE="$SCRIPT_DIR/vars.sh"
+
+if [[ -f "$VARS_FILE" ]]; then
+    source "$VARS_FILE"
+fi
 
 # ============================================================
 # Arguments
@@ -46,21 +60,26 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: --config requires a file path." >&2
                 exit 1
             fi
+
             CONFIG_FILE="$2"
             shift 2
             ;;
+
         --action)
             if [[ $# -lt 2 ]]; then
                 echo "Error: --action requires a value." >&2
                 exit 1
             fi
+
             ACTION="$2"
             shift 2
             ;;
+
         -h|--help)
             usage
             exit 0
             ;;
+
         *)
             echo "Error: unknown argument '$1'." >&2
             usage
@@ -81,9 +100,11 @@ fi
 
 # ============================================================
 # Save configuration copy
+# Preserve the input filename
 # ============================================================
 
-CONFIG_OUTPUT_FILE="$OUTPUT_DIR/benchmark_measurement.conf"
+CONFIG_FILENAME="$(basename -- "$CONFIG_FILE")"
+CONFIG_OUTPUT_FILE="$OUTPUT_DIR/$CONFIG_FILENAME"
 
 cp -- "$CONFIG_FILE" "$CONFIG_OUTPUT_FILE"
 
@@ -91,11 +112,7 @@ echo "Configuration copied to: $CONFIG_OUTPUT_FILE"
 
 # ============================================================
 # Read INI configuration
-# Supports quoted and unquoted values.
-# Examples:
-#   name = "perf"          -> perf
-#   sampling_interval = 20 -> 20
-#   baseline = true        -> true
+# Supports quoted and unquoted values
 # ============================================================
 
 read_config_value() {
@@ -128,7 +145,6 @@ read_config_value() {
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
 
                 if (k == key) {
-                    # Remove quotes only if they surround the whole value.
                     if (length(v) >= 2) {
                         first = substr(v, 1, 1)
                         last = substr(v, length(v), 1)
@@ -147,6 +163,10 @@ read_config_value() {
     ' "$CONFIG_FILE"
 }
 
+# ============================================================
+# Load tool configuration
+# ============================================================
+
 TOOL_NAME="$(read_config_value "tool" "name")"
 SAMPLING_INTERVAL="$(read_config_value "tool.configuration" "sampling_interval")"
 EVENTS="$(read_config_value "tool.configuration" "events")"
@@ -164,13 +184,13 @@ echo "Selected tool: $TOOL_NAME"
 
 TOOL_ARGS=()
 TOOL_LOG_FILE=""
+PERF_OUTPUT_FILE=""
+PERF_BASELINE_FILE=""
 
 case "$TOOL_NAME" in
     perf)
-        # Define perf output files only when perf is selected.
         PERF_OUTPUT_FILE="$OUTPUT_DIR/data.txt"
         PERF_BASELINE_FILE="$OUTPUT_DIR/baseline/data.txt"
-
         TOOL_LOG_FILE="$OUTPUT_DIR/perf.log"
 
         if [[ -z "$SAMPLING_INTERVAL" || -z "$EVENTS" ]]; then
@@ -196,7 +216,8 @@ esac
 
 start_measurement() {
     local output_file="$1"
-    shift
+    local pid_file="$2"
+    shift 2
 
     local tool_script="$SCRIPT_DIR/${TOOL_NAME}.sh"
 
@@ -205,9 +226,10 @@ start_measurement() {
         return 1
     fi
 
-    if [[ -f "$PID_FILE" ]]; then
+    # Prevent duplicate measurements of the same type.
+    if [[ -f "$pid_file" ]]; then
         local old_pid
-        old_pid="$(cat "$PID_FILE")"
+        old_pid="$(cat "$pid_file")"
 
         if [[ "$old_pid" =~ ^[0-9]+$ ]] &&
            kill -0 "$old_pid" 2>/dev/null; then
@@ -215,7 +237,7 @@ start_measurement() {
             return 1
         fi
 
-        rm -f "$PID_FILE"
+        rm -f "$pid_file"
     fi
 
     mkdir -p "$(dirname -- "$output_file")"
@@ -226,13 +248,14 @@ start_measurement() {
         > "$TOOL_LOG_FILE" 2>&1 &
 
     local pid=$!
-    printf '%s\n' "$pid" > "$PID_FILE"
+    printf '%s\n' "$pid" > "$pid_file"
 
+    # Allow the tool to initialize and detect startup failures.
     sleep 1
 
     if ! kill -0 "$pid" 2>/dev/null; then
         echo "Error: measurement process exited during startup." >&2
-        rm -f "$PID_FILE"
+        rm -f "$pid_file"
         cat "$TOOL_LOG_FILE" >&2 || true
         return 1
     fi
@@ -247,37 +270,51 @@ start_measurement() {
 # ============================================================
 
 stop_measurement() {
-    if [[ ! -f "$PID_FILE" ]]; then
-        echo "No measurement PID file found."
+    local pid_file="$1"
+
+    if [[ ! -f "$pid_file" ]]; then
+        echo "No measurement PID file found: $pid_file"
         return 0
     fi
 
     local pid
-    pid="$(cat "$PID_FILE")"
+    pid="$(cat "$pid_file")"
 
     if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
-        echo "Error: invalid PID in $PID_FILE." >&2
-        rm -f "$PID_FILE"
+        echo "Error: invalid PID in $pid_file." >&2
+        rm -f "$pid_file"
         return 1
     fi
 
     if kill -0 "$pid" 2>/dev/null; then
+        # Ask the tool to stop gracefully.
         kill -INT "$pid" 2>/dev/null || true
+
+        local stopped=false
 
         for _ in {1..15}; do
             if ! kill -0 "$pid" 2>/dev/null; then
+                stopped=true
                 break
             fi
             sleep 1
         done
 
-        if kill -0 "$pid" 2>/dev/null; then
+        if [[ "$stopped" == false ]] &&
+           kill -0 "$pid" 2>/dev/null; then
             echo "Warning: process is still running; sending TERM." >&2
             kill -TERM "$pid" 2>/dev/null || true
+
+            for _ in {1..5}; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 1
+            done
         fi
     fi
 
-    rm -f "$PID_FILE"
+    rm -f "$pid_file"
     echo "Measurement stopped."
 }
 
@@ -288,11 +325,14 @@ stop_measurement() {
 main_measurement() {
     date +%s.%N > "$TIMER_FILE_START"
 
-    start_measurement "$PERF_OUTPUT_FILE" "${TOOL_ARGS[@]}"
+    start_measurement \
+        "$PERF_OUTPUT_FILE" \
+        "$PID_FILE" \
+        "${TOOL_ARGS[@]}"
 }
 
 stop_main_measurement() {
-    stop_measurement
+    stop_measurement "$PID_FILE"
     date +%s.%N > "$TIMER_FILE_END"
 }
 
@@ -305,11 +345,14 @@ baseline_measurement() {
 
     date +%s.%N > "$TIMER_FILE_BASELINE_START"
 
-    start_measurement "$PERF_BASELINE_FILE" "${TOOL_ARGS[@]}"
+    start_measurement \
+        "$PERF_BASELINE_FILE" \
+        "$BASELINE_PID_FILE" \
+        "${TOOL_ARGS[@]}"
 }
 
 stop_baseline_measurement() {
-    stop_measurement
+    stop_measurement "$BASELINE_PID_FILE"
     date +%s.%N > "$TIMER_FILE_BASELINE_END"
 }
 
@@ -321,15 +364,19 @@ case "$ACTION" in
     start_measurement)
         main_measurement
         ;;
+
     stop_measurement)
         stop_main_measurement
         ;;
+
     baseline_measurement)
         baseline_measurement
         ;;
+
     stop_baseline_measurement)
         stop_baseline_measurement
         ;;
+
     *)
         echo "Error: unknown action '$ACTION'." >&2
         usage
