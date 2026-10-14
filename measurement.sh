@@ -22,11 +22,17 @@ PERF_BASELINE_FILE="$BASELINE_DIR/data.txt"
 TOOL_LOG_FILE="$OUTPUT_DIR/perf.log"
 
 # --------------------------------------------------
-# Arguments
+# Logging
 # --------------------------------------------------
 
-CONFIG_FILE=""
-ACTION=""
+log() {
+    printf '[measurement] %s\n' "$*"
+}
+
+die() {
+    printf '[measurement] ERROR: %s\n' "$*" >&2
+    exit 1
+}
 
 usage() {
     echo "Usage: $0 --config <config_file> --action <action>"
@@ -34,6 +40,13 @@ usage() {
     echo "         baseline_measurement, stop_baseline_measurement"
     exit 1
 }
+
+# --------------------------------------------------
+# Arguments
+# --------------------------------------------------
+
+CONFIG_FILE=""
+ACTION=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,10 +67,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$CONFIG_FILE" && -n "$ACTION" ]] || usage
-[[ -f "$CONFIG_FILE" ]] || {
-    echo "ERROR: Config not found: $CONFIG_FILE" >&2
-    exit 1
-}
+[[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
 
 mkdir -p "$OUTPUT_DIR" "$BASELINE_DIR"
 
@@ -65,19 +75,10 @@ CONFIG_FILE="$(realpath -- "$CONFIG_FILE")"
 CONFIG_FILENAME="$(basename -- "$CONFIG_FILE")"
 cp -- "$CONFIG_FILE" "$OUTPUT_DIR/$CONFIG_FILENAME"
 
-log() {
-    echo "[measurement] $*"
-}
-
-die() {
-    echo "[measurement] ERROR: $*" >&2
-    exit 1
-}
-
 # --------------------------------------------------
 # CI variables
-# Load the existing vars.sh functions without modifying
-# the vars.sh script in the repository.
+# vars.sh defines add_var and initialize_vars.
+# The variable values are written to /tmp/wattsci/vars.sh.
 # --------------------------------------------------
 
 if [[ -f "$VARS_SCRIPT" ]]; then
@@ -143,7 +144,7 @@ if [[ -f "$VARS_SCRIPT" ]]; then
             add_var COMMIT_HASH "${BUILD_SOURCEVERSION:-unknown}"
         fi
 
-        log "CI variables saved to $VARS_FILE"
+        log "CI variables saved using vars.sh"
     fi
 fi
 
@@ -162,7 +163,9 @@ read_config_value() {
             return s
         }
 
-        /^[[:space:]]*[;#]/ { next }
+        /^[[:space:]]*[;#]/ {
+            next
+        }
 
         /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
             current_section = $0
@@ -173,13 +176,19 @@ read_config_value() {
         }
 
         {
-            if (current_section != wanted_section) next
+            if (current_section != wanted_section) {
+                next
+            }
 
             pos = index($0, "=")
-            if (!pos) next
+            if (!pos) {
+                next
+            }
 
             current_key = trim(substr($0, 1, pos - 1))
-            if (current_key != wanted_key) next
+            if (current_key != wanted_key) {
+                next
+            }
 
             value = trim(substr($0, pos + 1))
 
@@ -194,15 +203,12 @@ read_config_value() {
 }
 
 # --------------------------------------------------
-# Read measurement configuration
+# Read configuration
 # --------------------------------------------------
 
 TOOL_NAME="$(read_config_value "tool" "name")"
 SAMPLING_INTERVAL="$(read_config_value "tool.configuration" "sampling_interval")"
 EVENTS="$(read_config_value "tool.configuration" "events")"
-
-# IMPORTANT:
-# In your config, baseline is under [methodology.execution].
 HAS_BASELINE="$(read_config_value "methodology.execution" "baseline")"
 
 [[ -n "$TOOL_NAME" ]] || die "Missing tool.name in config"
@@ -218,7 +224,7 @@ log "Events: $EVENTS"
 log "Baseline enabled: ${HAS_BASELINE:-false}"
 
 # --------------------------------------------------
-# Process management
+# Process helpers
 # --------------------------------------------------
 
 is_running() {
@@ -266,6 +272,7 @@ start_process() {
     log "Output: $output_file"
 }
 
+# Stop directly with SIGTERM, then wait up to 5 seconds.
 stop_process() {
     local pid_file="$1"
     local timer_end="$2"
@@ -287,23 +294,12 @@ stop_process() {
     if ! kill -0 "$pid" 2>/dev/null; then
         rm -f -- "$pid_file"
         log "Process $pid is no longer running"
+        date +%s > "$timer_end"
         return 0
     fi
 
-    log "Stopping PID $pid"
-    kill -INT "$pid" 2>/dev/null || true
-
-    while kill -0 "$pid" 2>/dev/null && (( attempts < 15 )); do
-        sleep 1
-        ((attempts += 1))
-    done
-
-    if kill -0 "$pid" 2>/dev/null; then
-        log "SIGINT timeout; sending SIGTERM"
-        kill -TERM "$pid" 2>/dev/null || true
-    fi
-
-    attempts=0
+    log "Sending SIGTERM to PID $pid"
+    kill -TERM "$pid" 2>/dev/null || true
 
     while kill -0 "$pid" 2>/dev/null && (( attempts < 5 )); do
         sleep 1
@@ -311,13 +307,15 @@ stop_process() {
     done
 
     if kill -0 "$pid" 2>/dev/null; then
-        log "WARNING: PID $pid still exists"
-    else
-        rm -f -- "$pid_file"
+        log "ERROR: PID $pid is still running after SIGTERM"
+        log "Keeping PID file for later inspection"
+        return 1
     fi
 
+    rm -f -- "$pid_file"
     date +%s > "$timer_end"
-    log "Stopped"
+
+    log "Process $pid stopped"
 }
 
 # --------------------------------------------------
@@ -356,6 +354,10 @@ run_baseline_automatically() {
     start_baseline
     sleep 10
     stop_baseline
+
+    if is_running "$BASELINE_PID_FILE"; then
+        die "Baseline process is still running; normal measurement will not start."
+    fi
 
     if ! baseline_has_data; then
         die "Baseline produced no data. Inspect $TOOL_LOG_FILE"
