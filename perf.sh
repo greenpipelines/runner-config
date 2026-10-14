@@ -1,96 +1,193 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================================================
+# ARGUMENT PARSING
+# =========================================================
+
 if [[ $# -lt 1 ]]; then
-    echo "[ERROR] Missing output file argument"
-    echo "[INFO] Usage: $0 <output_file> events=<event1,event2,...> interval=<ms>"
+    echo "[ERROR] Missing output file argument."
+    echo "[INFO] Usage:"
+    echo "  $0 <output_file> --sampling_interval <ms> --events <event1,event2,...>"
     exit 1
 fi
 
 OUTPUT_FILE="$1"
-shift 1
+shift
 
 INTERVAL_MS=1000
 REQUESTED_EVENTS=()
 
 function show_usage() {
-    echo "[INFO] Usage: $0 <output_file> events=<event1,event2,...> interval=<ms>"
+    echo "[INFO] Usage:"
+    echo "  $0 <output_file> --sampling_interval <ms> --events <event1,event2,...>"
     exit 1
 }
 
-function setup_output_dir() {
-    mkdir -p "$(dirname "$OUTPUT_FILE")"
-    echo "[DEBUG] Output directory created: $(dirname "$OUTPUT_FILE")"
-}
-
 function parse_arguments() {
-    for arg in "$@"; do
-        case "$arg" in
-            interval=*)
-                INTERVAL_MS="${arg#interval=}"
-                echo "[INFO] Interval set to $INTERVAL_MS ms"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --sampling_interval)
+                if [[ $# -lt 2 ]]; then
+                    echo "[ERROR] Missing value for --sampling_interval."
+                    show_usage
+                fi
+
+                INTERVAL_MS="$2"
+                shift 2
                 ;;
-            events=*)
-                IFS=',' read -r -a REQUESTED_EVENTS <<< "${arg#events=}"
-                echo "[INFO] Requested events: ${REQUESTED_EVENTS[*]}"
+
+            --events)
+                if [[ $# -lt 2 ]]; then
+                    echo "[ERROR] Missing value for --events."
+                    show_usage
+                fi
+
+                IFS=',' read -r -a REQUESTED_EVENTS <<< "$2"
+                shift 2
                 ;;
+
             *)
-                echo "[ERROR] Unknown argument: $arg"
+                echo "[ERROR] Unknown argument: $1"
                 show_usage
                 ;;
         esac
     done
 
-    if [[ ${#REQUESTED_EVENTS[@]} -eq 0 ]]; then
+    if [[ ! "$INTERVAL_MS" =~ ^[0-9]+$ ]] || (( INTERVAL_MS <= 0 )); then
+        echo "[ERROR] Sampling interval must be a positive integer."
+        exit 1
+    fi
+
+    if (( ${#REQUESTED_EVENTS[@]} == 0 )); then
         echo "[ERROR] No events specified."
         show_usage
     fi
 }
 
+# =========================================================
+# OUTPUT DIRECTORY
+# =========================================================
+
+function setup_output_dir() {
+    local output_dir
+    output_dir="$(dirname "$OUTPUT_FILE")"
+
+    mkdir -p "$output_dir"
+
+    echo "[DEBUG] Output directory: $output_dir"
+    echo "[INFO] Output file: $OUTPUT_FILE"
+}
+
+# =========================================================
+# PERF PERMISSIONS
+# =========================================================
+
 function check_perf_paranoid() {
-    local PERF_PARANOID
-    PERF_PARANOID=$(< /proc/sys/kernel/perf_event_paranoid)
-    if [[ "$PERF_PARANOID" -gt 1 ]]; then
-        echo "[WARNING] perf_event_paranoid is $PERF_PARANOID. You may need root privileges."
+    local perf_paranoid
+
+    if [[ ! -r /proc/sys/kernel/perf_event_paranoid ]]; then
+        echo "[WARNING] Cannot read perf_event_paranoid."
+        return
+    fi
+
+    perf_paranoid=$(< /proc/sys/kernel/perf_event_paranoid)
+
+    if [[ "$perf_paranoid" =~ ^-?[0-9]+$ ]] && (( perf_paranoid > 1 )); then
+        echo "[WARNING] perf_event_paranoid is $perf_paranoid."
+        echo "[WARNING] Elevated privileges may be required."
     else
-        echo "[DEBUG] perf_event_paranoid is $PERF_PARANOID"
+        echo "[DEBUG] perf_event_paranoid is $perf_paranoid"
     fi
 }
 
+# =========================================================
+# EVENT VALIDATION
+# =========================================================
+
 function validate_events() {
-    mapfile -t AVAILABLE_EVENTS < <(perf list | grep -E '^ *power/energy-[^ ]+/' | awk '{print $1}')
-    VALID_EVENTS=()
-    INVALID_EVENTS=()
+    local available_events=()
+    local valid_events=()
+    local invalid_events=()
+    local event
 
-    for evt in "${REQUESTED_EVENTS[@]}"; do
-        if printf '%s\n' "${AVAILABLE_EVENTS[@]}" | grep -Fxq "$evt"; then
-            VALID_EVENTS+=("$evt")
-        else
-            INVALID_EVENTS+=("$evt")
-        fi
-    done
-
-    if (( ${#VALID_EVENTS[@]} == 0 )); then
-        echo "[ERROR] No valid events available."
+    if ! command -v perf >/dev/null 2>&1; then
+        echo "[ERROR] perf is not installed or not available in PATH."
         exit 1
     fi
 
-    if (( ${#INVALID_EVENTS[@]} > 0 )); then
-        echo "[WARNING] Ignoring unavailable events: ${INVALID_EVENTS[*]}"
+    mapfile -t available_events < <(
+        perf list 2>/dev/null |
+            grep -E '^ *power/energy-[^ ]+/' |
+            awk '{print $1}' ||
+            true
+    )
+
+    for event in "${REQUESTED_EVENTS[@]}"; do
+        # Trim surrounding whitespace.
+        event="${event#"${event%%[![:space:]]*}"}"
+        event="${event%"${event##*[![:space:]]}"}"
+
+        [[ -z "$event" ]] && continue
+
+        if printf '%s\n' "${available_events[@]}" | grep -Fxq "$event"; then
+            valid_events+=("$event")
+        else
+            invalid_events+=("$event")
+        fi
+    done
+
+    if (( ${#invalid_events[@]} > 0 )); then
+        echo "[WARNING] Unavailable events: ${invalid_events[*]}"
     fi
 
-    echo "[INFO] Valid events to monitor: ${VALID_EVENTS[*]}"
+    if (( ${#valid_events[@]} == 0 )); then
+        echo "[ERROR] No valid requested events are available."
+        echo "[INFO] Available power events:"
+        printf '  %s\n' "${available_events[@]}"
+        exit 1
+    fi
+
+    REQUESTED_EVENTS=("${valid_events[@]}")
+
+    echo "[INFO] Valid events: ${REQUESTED_EVENTS[*]}"
 }
+
+# =========================================================
+# RUN PERF
+# =========================================================
 
 function run_perf() {
+    local events_csv
+    events_csv=$(IFS=,; echo "${REQUESTED_EVENTS[*]}")
+
     echo "[INFO] Starting perf measurement..."
-    echo "[DEBUG] perf command: perf stat -a -I $INTERVAL_MS -e $(IFS=','; echo "${VALID_EVENTS[*]}")"
-    LC_NUMERIC=C perf stat -a -I "$INTERVAL_MS" -e "$(IFS=','; echo "${VALID_EVENTS[*]}")" 2> "$OUTPUT_FILE"
-    echo "[INFO] Perf measurement completed. Output saved to $OUTPUT_FILE"
+    echo "[INFO] Sampling interval: ${INTERVAL_MS} ms"
+    echo "[INFO] Events: ${events_csv}"
+    echo "[INFO] Output: ${OUTPUT_FILE}"
+
+    echo "[DEBUG] Command:"
+    echo "perf stat -a -I $INTERVAL_MS -e $events_csv"
+
+    # Keep perf's output in the specified file.
+    # perf stat writes measurement results to stderr.
+    LC_NUMERIC=C perf stat \
+        -a \
+        -I "$INTERVAL_MS" \
+        -e "$events_csv" \
+        2> "$OUTPUT_FILE"
+
+    echo "[INFO] Perf measurement completed."
+    echo "[INFO] Output saved to: $OUTPUT_FILE"
 }
 
-setup_output_dir
+# =========================================================
+# MAIN
+# =========================================================
+
 parse_arguments "$@"
+setup_output_dir
 check_perf_paranoid
 validate_events
 run_perf
