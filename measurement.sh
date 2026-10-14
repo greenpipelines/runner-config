@@ -1,385 +1,362 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
-
-# ============================================================
-# General paths
-# ============================================================
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 OUTPUT_DIR="/tmp/wattsci"
+BASELINE_DIR="$OUTPUT_DIR/baseline"
 
-# Main measurement PID
+VARS_FILE="$OUTPUT_DIR/vars.sh"
+
 PID_FILE="$OUTPUT_DIR/measurement.pid"
+BASELINE_PID_FILE="$BASELINE_DIR/measurement.pid"
 
-# Baseline measurement PID
-BASELINE_PID_FILE="$OUTPUT_DIR/baseline/measurement.pid"
-
-# Main measurement timers
 TIMER_FILE_START="$OUTPUT_DIR/timer_start.txt"
 TIMER_FILE_END="$OUTPUT_DIR/timer_end.txt"
+TIMER_FILE_BASELINE_START="$BASELINE_DIR/start.txt"
+TIMER_FILE_BASELINE_END="$BASELINE_DIR/end.txt"
 
-# Baseline measurement timers
-TIMER_FILE_BASELINE_START="$OUTPUT_DIR/baseline/start.txt"
-TIMER_FILE_BASELINE_END="$OUTPUT_DIR/baseline/end.txt"
+PERF_OUTPUT_FILE="$OUTPUT_DIR/data.txt"
+PERF_BASELINE_FILE="$BASELINE_DIR/data.txt"
+TOOL_LOG_FILE="$OUTPUT_DIR/perf.log"
 
-mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/baseline"
-
-# ============================================================
-# CI variables
-# ============================================================
-
-VARS_FILE="$SCRIPT_DIR/vars.sh"
+# --------------------------------------------------
+# Load existing vars.sh without changing its path
+# --------------------------------------------------
 
 if [[ -f "$VARS_FILE" ]]; then
     source "$VARS_FILE"
 fi
 
-# ============================================================
-# Arguments
-# ============================================================
+# --------------------------------------------------
+# Logging and usage
+# --------------------------------------------------
 
-CONFIG_FILE=""
-ACTION=""
+log() {
+    printf '[measurement] %s\n' "$*"
+}
+
+die() {
+    printf '[measurement] ERROR: %s\n' "$*" >&2
+    exit 1
+}
 
 usage() {
     echo "Usage: $0 --config <config_file> --action <action>"
-    echo
     echo "Actions:"
     echo "  start_measurement"
     echo "  stop_measurement"
     echo "  baseline_measurement"
     echo "  stop_baseline_measurement"
+    exit 1
 }
+
+# --------------------------------------------------
+# Arguments
+# --------------------------------------------------
+
+CONFIG_FILE=""
+ACTION=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --config)
-            if [[ $# -lt 2 ]]; then
-                echo "Error: --config requires a file path." >&2
-                exit 1
-            fi
-
+            [[ $# -ge 2 ]] || usage
             CONFIG_FILE="$2"
             shift 2
             ;;
-
         --action)
-            if [[ $# -lt 2 ]]; then
-                echo "Error: --action requires a value." >&2
-                exit 1
-            fi
-
+            [[ $# -ge 2 ]] || usage
             ACTION="$2"
             shift 2
             ;;
-
-        -h|--help)
-            usage
-            exit 0
-            ;;
-
         *)
-            echo "Error: unknown argument '$1'." >&2
             usage
-            exit 1
             ;;
     esac
 done
 
-if [[ -z "$CONFIG_FILE" || -z "$ACTION" ]]; then
-    usage
-    exit 1
-fi
+[[ -n "$CONFIG_FILE" ]] || usage
+[[ -n "$ACTION" ]] || usage
+[[ -f "$CONFIG_FILE" ]] || die "Config file not found: $CONFIG_FILE"
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo "Error: configuration file not found: $CONFIG_FILE" >&2
-    exit 1
-fi
+# --------------------------------------------------
+# Directories and config copy
+# --------------------------------------------------
 
-# ============================================================
-# Save configuration copy
-# Preserve the input filename
-# ============================================================
+mkdir -p "$OUTPUT_DIR" "$BASELINE_DIR"
 
+CONFIG_FILE="$(realpath -- "$CONFIG_FILE")"
 CONFIG_FILENAME="$(basename -- "$CONFIG_FILE")"
 CONFIG_OUTPUT_FILE="$OUTPUT_DIR/$CONFIG_FILENAME"
 
 cp -- "$CONFIG_FILE" "$CONFIG_OUTPUT_FILE"
 
-echo "Configuration copied to: $CONFIG_OUTPUT_FILE"
-
-# ============================================================
-# Read INI configuration
-# Supports quoted and unquoted values
-# ============================================================
+# --------------------------------------------------
+# INI configuration parser
+# --------------------------------------------------
 
 read_config_value() {
     local section="$1"
     local key="$2"
 
-    awk -v section="$section" -v key="$key" '
-        /^[[:space:]]*\[/ {
-            current_section = $0
-            sub(/^[[:space:]]*\[/, "", current_section)
-            sub(/\][[:space:]]*$/, "", current_section)
+    awk -v wanted_section="$section" -v wanted_key="$key" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+
+        /^[[:space:]]*[;#]/ {
             next
         }
 
-        current_section == section {
-            line = $0
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            current_section = $0
+            sub(/^[[:space:]]*\[/, "", current_section)
+            sub(/\][[:space:]]*$/, "", current_section)
+            current_section = trim(current_section)
+            next
+        }
 
-            if (line ~ /^[[:space:]]*$/ ||
-                line ~ /^[[:space:]]*[#;]/) {
+        {
+            if (current_section != wanted_section) {
                 next
             }
 
-            separator = index(line, "=")
-
-            if (separator > 0) {
-                k = substr(line, 1, separator - 1)
-                v = substr(line, separator + 1)
-
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-
-                if (k == key) {
-                    if (length(v) >= 2) {
-                        first = substr(v, 1, 1)
-                        last = substr(v, length(v), 1)
-
-                        if ((first == "\"" && last == "\"") ||
-                            (first == "\047" && last == "\047")) {
-                            v = substr(v, 2, length(v) - 2)
-                        }
-                    }
-
-                    print v
-                    exit
-                }
+            pos = index($0, "=")
+            if (!pos) {
+                next
             }
+
+            current_key = trim(substr($0, 1, pos - 1))
+
+            if (current_key != wanted_key) {
+                next
+            }
+
+            value = trim(substr($0, pos + 1))
+
+            if (value ~ /^".*"$/ || value ~ /^'\''.*'\''$/) {
+                value = substr(value, 2, length(value) - 2)
+            }
+
+            print value
+            exit
         }
     ' "$CONFIG_FILE"
 }
 
-# ============================================================
-# Load tool configuration
-# ============================================================
+# --------------------------------------------------
+# Read tool configuration
+# --------------------------------------------------
 
 TOOL_NAME="$(read_config_value "tool" "name")"
 SAMPLING_INTERVAL="$(read_config_value "tool.configuration" "sampling_interval")"
 EVENTS="$(read_config_value "tool.configuration" "events")"
+HAS_BASELINE="$(read_config_value "tool.configuration" "hasbaseline")"
 
-if [[ -z "$TOOL_NAME" ]]; then
-    echo "Error: tool.name is missing from the configuration." >&2
-    exit 1
-fi
+[[ -n "$TOOL_NAME" ]] || die "Missing [tool] name in config"
+[[ -n "$SAMPLING_INTERVAL" ]] || die "Missing sampling_interval in config"
+[[ -n "$EVENTS" ]] || die "Missing events in config"
 
-echo "Selected tool: $TOOL_NAME"
+TOOL_SCRIPT="$SCRIPT_DIR/${TOOL_NAME}.sh"
 
-# ============================================================
-# Tool-specific configuration
-# ============================================================
+[[ -f "$TOOL_SCRIPT" ]] || die "Tool script not found: $TOOL_SCRIPT"
 
-TOOL_ARGS=()
-TOOL_LOG_FILE=""
-PERF_OUTPUT_FILE=""
-PERF_BASELINE_FILE=""
+# --------------------------------------------------
+# Process helpers
+# --------------------------------------------------
 
-case "$TOOL_NAME" in
-    perf)
-        PERF_OUTPUT_FILE="$OUTPUT_DIR/data.txt"
-        PERF_BASELINE_FILE="$OUTPUT_DIR/baseline/data.txt"
-        TOOL_LOG_FILE="$OUTPUT_DIR/perf.log"
+is_running() {
+    local pid_file="$1"
+    local pid
 
-        if [[ -z "$SAMPLING_INTERVAL" || -z "$EVENTS" ]]; then
-            echo "Error: perf requires sampling_interval and events." >&2
-            exit 1
-        fi
+    [[ -f "$pid_file" ]] || return 1
 
-        TOOL_ARGS=(
-            --sampling_interval "$SAMPLING_INTERVAL"
-            --events "$EVENTS"
-        )
-        ;;
+    pid="$(<"$pid_file")"
 
-    *)
-        echo "Error: unsupported tool '$TOOL_NAME'." >&2
-        exit 1
-        ;;
-esac
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
 
-# ============================================================
-# Start measurement
-# ============================================================
+    kill -0 "$pid" 2>/dev/null
+}
 
-start_measurement() {
+start_measurement_process() {
     local output_file="$1"
     local pid_file="$2"
-    shift 2
+    local start_file="$3"
+    shift 3
 
-    local tool_script="$SCRIPT_DIR/${TOOL_NAME}.sh"
-
-    if [[ ! -f "$tool_script" ]]; then
-        echo "Error: tool script not found: $tool_script" >&2
-        return 1
+    if is_running "$pid_file"; then
+        die "Measurement already running (PID $(<"$pid_file"))"
     fi
 
-    # Prevent duplicate measurements of the same type.
-    if [[ -f "$pid_file" ]]; then
-        local old_pid
-        old_pid="$(cat "$pid_file")"
+    rm -f -- "$pid_file"
 
-        if [[ "$old_pid" =~ ^[0-9]+$ ]] &&
-           kill -0 "$old_pid" 2>/dev/null; then
-            echo "Error: measurement already running (PID: $old_pid)." >&2
-            return 1
-        fi
+    mkdir -p "$(dirname "$output_file")"
 
-        rm -f "$pid_file"
-    fi
+    : > "$output_file"
+    date +%s > "$start_file"
 
-    mkdir -p "$(dirname -- "$output_file")"
-
-    nohup bash "$tool_script" \
-        "$output_file" \
-        "$@" \
-        > "$TOOL_LOG_FILE" 2>&1 &
+    nohup bash "$TOOL_SCRIPT" "$output_file" "$@" \
+        >> "$TOOL_LOG_FILE" 2>&1 &
 
     local pid=$!
+
     printf '%s\n' "$pid" > "$pid_file"
 
-    # Allow the tool to initialize and detect startup failures.
     sleep 1
 
     if ! kill -0 "$pid" 2>/dev/null; then
-        echo "Error: measurement process exited during startup." >&2
-        rm -f "$pid_file"
-        cat "$TOOL_LOG_FILE" >&2 || true
-        return 1
+        rm -f -- "$pid_file"
+        die "Measurement failed to start. Check $TOOL_LOG_FILE"
     fi
 
-    echo "Started $TOOL_NAME measurement."
-    echo "PID: $pid"
-    echo "Output: $output_file"
+    log "Measurement started (PID $pid)"
+    log "Output: $output_file"
 }
 
-# ============================================================
-# Stop measurement
-# ============================================================
-
-stop_measurement() {
+stop_measurement_process() {
     local pid_file="$1"
+    local end_file="$2"
+    local pid
+    local attempts=0
 
     if [[ ! -f "$pid_file" ]]; then
-        echo "No measurement PID file found: $pid_file"
+        log "No PID file found: $pid_file"
         return 0
     fi
 
-    local pid
-    pid="$(cat "$pid_file")"
+    pid="$(<"$pid_file")"
 
-    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
-        echo "Error: invalid PID in $pid_file." >&2
-        rm -f "$pid_file"
-        return 1
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        rm -f -- "$pid_file"
+        die "Invalid PID in $pid_file"
     fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f -- "$pid_file"
+        log "Process $pid is not running"
+        return 0
+    fi
+
+    log "Stopping measurement (PID $pid)"
+
+    kill -INT "$pid" 2>/dev/null || true
+
+    while kill -0 "$pid" 2>/dev/null && (( attempts < 15 )); do
+        sleep 1
+        ((attempts += 1))
+    done
 
     if kill -0 "$pid" 2>/dev/null; then
-        # Ask the tool to stop gracefully.
-        kill -INT "$pid" 2>/dev/null || true
-
-        local stopped=false
-
-        for _ in {1..15}; do
-            if ! kill -0 "$pid" 2>/dev/null; then
-                stopped=true
-                break
-            fi
-            sleep 1
-        done
-
-        if [[ "$stopped" == false ]] &&
-           kill -0 "$pid" 2>/dev/null; then
-            echo "Warning: process is still running; sending TERM." >&2
-            kill -TERM "$pid" 2>/dev/null || true
-
-            for _ in {1..5}; do
-                if ! kill -0 "$pid" 2>/dev/null; then
-                    break
-                fi
-                sleep 1
-            done
-        fi
+        log "Process did not stop with SIGINT; sending SIGTERM"
+        kill -TERM "$pid" 2>/dev/null || true
     fi
 
-    rm -f "$pid_file"
-    echo "Measurement stopped."
+    attempts=0
+
+    while kill -0 "$pid" 2>/dev/null && (( attempts < 5 )); do
+        sleep 1
+        ((attempts += 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        log "WARNING: process $pid is still running"
+    else
+        rm -f -- "$pid_file"
+    fi
+
+    date +%s > "$end_file"
+
+    log "Measurement stopped"
 }
 
-# ============================================================
-# Main measurement
-# ============================================================
+# --------------------------------------------------
+# Baseline helpers
+# --------------------------------------------------
 
-main_measurement() {
-    date +%s.%N > "$TIMER_FILE_START"
-
-    start_measurement \
-        "$PERF_OUTPUT_FILE" \
-        "$PID_FILE" \
-        "${TOOL_ARGS[@]}"
+baseline_has_data() {
+    [[ -s "$PERF_BASELINE_FILE" ]]
 }
 
-stop_main_measurement() {
-    stop_measurement "$PID_FILE"
-    date +%s.%N > "$TIMER_FILE_END"
-}
+start_baseline() {
+    if is_running "$BASELINE_PID_FILE"; then
+        log "Baseline measurement is already running"
+        return 0
+    fi
 
-# ============================================================
-# Baseline measurement
-# ============================================================
-
-baseline_measurement() {
-    mkdir -p "$OUTPUT_DIR/baseline"
-
-    date +%s.%N > "$TIMER_FILE_BASELINE_START"
-
-    start_measurement \
+    start_measurement_process \
         "$PERF_BASELINE_FILE" \
         "$BASELINE_PID_FILE" \
-        "${TOOL_ARGS[@]}"
+        "$TIMER_FILE_BASELINE_START" \
+        --sampling_interval "$SAMPLING_INTERVAL" \
+        --events "$EVENTS"
 }
 
-stop_baseline_measurement() {
-    stop_measurement "$BASELINE_PID_FILE"
-    date +%s.%N > "$TIMER_FILE_BASELINE_END"
+stop_baseline() {
+    stop_measurement_process \
+        "$BASELINE_PID_FILE" \
+        "$TIMER_FILE_BASELINE_END"
 }
 
-# ============================================================
-# Action dispatcher
-# ============================================================
+start_normal_measurement() {
+    start_measurement_process \
+        "$PERF_OUTPUT_FILE" \
+        "$PID_FILE" \
+        "$TIMER_FILE_START" \
+        --sampling_interval "$SAMPLING_INTERVAL" \
+        --events "$EVENTS"
+}
+
+run_baseline_automatically() {
+    log "Baseline is enabled and its output is empty."
+    log "Starting baseline measurement for 10 seconds."
+
+    start_baseline
+
+    sleep 10
+
+    stop_baseline
+
+    if ! baseline_has_data; then
+        die "Baseline completed but no data was generated. Check $TOOL_LOG_FILE"
+    fi
+
+    log "Baseline completed."
+    log "Starting normal measurement."
+
+    start_normal_measurement
+}
+
+# --------------------------------------------------
+# Actions
+# --------------------------------------------------
 
 case "$ACTION" in
     start_measurement)
-        main_measurement
+        if [[ "${HAS_BASELINE,,}" == "true" ]] && ! baseline_has_data; then
+            run_baseline_automatically
+        else
+            start_normal_measurement
+        fi
         ;;
 
     stop_measurement)
-        stop_main_measurement
+        stop_measurement_process \
+            "$PID_FILE" \
+            "$TIMER_FILE_END"
         ;;
 
     baseline_measurement)
-        baseline_measurement
+        run_baseline_automatically
         ;;
 
     stop_baseline_measurement)
-        stop_baseline_measurement
+        stop_baseline
         ;;
 
     *)
-        echo "Error: unknown action '$ACTION'." >&2
         usage
-        exit 1
         ;;
 esac
